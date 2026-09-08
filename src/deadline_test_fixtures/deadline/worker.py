@@ -1874,14 +1874,15 @@ class LocalMacWorker(DeadlineWorker):
         # `state = running` check below can be satisfied by the daemon the installer
         # loaded, which never picked up the plist environment written after it started.
         self.stop_worker_service()
+        # worker.json is deliberately left alone here. It is how the agent keeps its
+        # identity across a restart, and this method is half of a public stop/start pair
+        # that tests use mid-run: removing it would make the agent call CreateWorker again
+        # and come back as a different worker, orphaning the first record against the
+        # fleet's maxWorkerCount and overwriting self.worker_id below. `start()` clears it
+        # once, before the installer, which is where a stale file has to be dealt with.
         result = self.send_command(
             " && ".join(
                 [
-                    # get_worker_id polls only until worker.json parses, so any file left by
-                    # an earlier agent would be read as this worker's id. Removed once the
-                    # stop above has confirmed the old daemon is gone, so nothing is running
-                    # that could write it back before the bootstrap below.
-                    f"rm -f {self.WORKER_JSON_PATH}",
                     # Retried because the label can linger a moment past the wait above,
                     # and the failure mode is an unhelpful "Input/output error". The
                     # explicit flag matters: a bash for loop exits with the status of the

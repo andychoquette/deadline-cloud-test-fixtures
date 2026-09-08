@@ -1105,9 +1105,14 @@ class TestLocalMacWorker:
 
         stop.assert_called_once()
 
-    def test_worker_json_is_removed_before_the_bootstrap(self, mac_worker: Any) -> None:
-        """get_worker_id polls only until the file parses, so a pre-bootstrap worker.json
-        would be adopted as this worker's id."""
+    def test_restarting_the_service_preserves_the_agent_identity(self, mac_worker: Any) -> None:
+        """worker.json is how the agent keeps its identity across a restart.
+
+        stop_worker_service/start_worker_service is a public pair that tests use mid-run,
+        so removing the file here would make the agent register a second worker, orphan the
+        first against the fleet's maxWorkerCount, and make any test asserting that the
+        agent resumes its prior identity pass for the wrong reason.
+        """
         with (
             patch.object(mac_worker, "stop_worker_service"),
             patch.object(mac_worker, "send_command", return_value=CommandResult(0, "")) as send,
@@ -1115,22 +1120,7 @@ class TestLocalMacWorker:
         ):
             mac_worker.start_worker_service()
 
-        cmd = self._commands(send)[0]
-        assert f"rm -f {mac_worker.WORKER_JSON_PATH}" in cmd
-        assert cmd.index("rm -f") < cmd.index("launchctl bootstrap")
-
-    def test_start_worker_service_waits_via_the_stop_path(self, mac_worker: Any) -> None:
-        """Reusing stop_worker_service is what makes the wait raise on a lingering label;
-        an open-coded bootout here would let the installer's daemon satisfy the
-        `state = running` check."""
-        with (
-            patch.object(mac_worker, "stop_worker_service") as stop,
-            patch.object(mac_worker, "send_command", return_value=CommandResult(0, "")),
-            patch.object(mac_worker, "get_worker_id", return_value="worker-" + "0" * 32),
-        ):
-            mac_worker.start_worker_service()
-
-        stop.assert_called_once()
+        assert mac_worker.WORKER_JSON_PATH not in " ".join(self._commands(send))
 
     def test_bootstrap_failure_is_not_swallowed_by_the_retry_loop(self, mac_worker: Any) -> None:
         """A bash for loop exits with the status of the last command in its body, so an
