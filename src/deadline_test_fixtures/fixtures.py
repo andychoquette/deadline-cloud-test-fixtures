@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import MISSING, InitVar, dataclass, field, fields
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 import boto3
 import botocore
@@ -32,6 +32,7 @@ from .deadline.worker import (
     DeadlineWorkerConfiguration,
     DockerContainerWorker,
     EC2InstanceWorker,
+    LocalMacWorker,
     PipInstall,
     PosixInstanceBuildWorker,
     WindowsInstanceBuildWorker,
@@ -534,16 +535,22 @@ def worker_config(
 
 @pytest.fixture(scope="session")
 def ec2_worker_type(request: pytest.FixtureRequest) -> Generator[type[DeadlineWorker], None, None]:
-    # Allows overriding the base EC2InstanceWorker type with another derived type.
+    # Allows overriding the base worker type with another derived type.
+    #
+    # MACOS yields LocalMacWorker, which is not an EC2 worker: it configures the agent on the host
+    # running the tests rather than provisioning a machine. The name is kept because it is the
+    # documented override point that suites already use.
     operating_system = request.getfixturevalue("operating_system")
 
     if operating_system.name == "AL2023":
         yield PosixInstanceBuildWorker
     elif operating_system.name == "WIN2022":
         yield WindowsInstanceBuildWorker
+    elif operating_system.name == "MACOS":
+        yield LocalMacWorker
     else:
         raise ValueError(
-            'Invalid value provided for "operating_system", valid options are \'OperatingSystem("AL2023")\' or \'OperatingSystem("WIN2022")\'.'
+            'Invalid value provided for "operating_system", valid options are \'OperatingSystem("AL2023")\', \'OperatingSystem("WIN2022")\' or \'OperatingSystem("MACOS")\'.'
         )
 
 
@@ -551,7 +558,7 @@ def ec2_worker_type(request: pytest.FixtureRequest) -> Generator[type[DeadlineWo
 def worker(
     request: pytest.FixtureRequest,
     worker_config: DeadlineWorkerConfiguration,
-    ec2_worker_type: type[EC2InstanceWorker],
+    ec2_worker_type: type[DeadlineWorker],
 ) -> Generator[DeadlineWorker, None, None]:
     """
     Gets a DeadlineWorker for use in tests.
@@ -567,15 +574,30 @@ def worker(
         USE_DOCKER_WORKER: If set to "true", this fixture will create a Worker that runs in a local Docker container instead of an EC2 instance.
         KEEP_WORKER_AFTER_FAILURE: If set to "true", will not destroy the Worker when it fails. Useful for debugging. Default is "false"
 
+    On MACOS the agent is installed onto the host running the tests, so SUBNET_ID, SECURITY_GROUP_ID,
+    AMI_ID and the worker instance profile do not apply. That host must be macOS with passwordless
+    sudo; see LocalMacWorker.
+
     Returns:
         DeadlineWorker: Instance of the DeadlineWorker class that can be used to interact with the Worker.
     """
+
+    operating_system = request.getfixturevalue("operating_system")
 
     worker: DeadlineWorker
     if os.environ.get("USE_DOCKER_WORKER", "").lower() == "true":
         LOG.info("Creating Docker worker")
         worker = DockerContainerWorker(
             configuration=worker_config,
+        )
+    elif operating_system.is_macos():
+        # Before the EC2 branch, because none of what it needs exists here: there is no instance to
+        # place in a subnet or a security group, and no instance profile to attach. The asserts
+        # below would fail on a host that is otherwise perfectly able to run the suite.
+        LOG.info("Creating local macOS worker")
+        worker = cast("type[LocalMacWorker]", ec2_worker_type)(
+            configuration=worker_config,
+            deadline_client=boto3.client("deadline"),
         )
     else:
         LOG.info("Creating EC2 worker")
@@ -598,7 +620,7 @@ def worker(
         ssm_client = boto3.client("ssm")
         deadline_client = boto3.client("deadline")
 
-        worker = ec2_worker_type(
+        worker = cast("type[EC2InstanceWorker]", ec2_worker_type)(
             ec2_client=ec2_client,
             s3_client=s3_client,
             deadline_client=deadline_client,
