@@ -208,3 +208,47 @@ class TestWorkerFixtureOnMacos:
         self._run("MACOS", factory)
         assert len(built) == 1
         assert set(built[0]) == {"configuration", "deadline_client"}
+
+
+class TestOperatingSystemFixtureGate:
+    """The opt-in is enforced where MACOS is first selected, not only where the host is modified.
+
+    `worker` depends on `worker_config`, which depends on `deadline_resources`; pytest resolves all
+    of those before `worker`'s body runs. A gate only in `worker` therefore fires after the
+    bootstrap stack, farm, queue and fleet already exist -- it stops the install, but not the bill.
+    """
+
+    @staticmethod
+    def _run(param: str) -> Any:
+        request = MagicMock()
+        request.param = param
+        return cast(Any, fixtures.operating_system).__wrapped__(request)
+
+    def test_refuses_macos_without_the_opt_in(self, monkeypatch) -> None:
+        monkeypatch.delenv("USE_LOCAL_MAC_WORKER", raising=False)
+        with pytest.raises(RuntimeError, match="USE_LOCAL_MAC_WORKER"):
+            self._run("macos")
+
+    def test_allows_macos_with_the_opt_in(self, monkeypatch) -> None:
+        monkeypatch.setenv("USE_LOCAL_MAC_WORKER", "true")
+        assert self._run("macos").name == "MACOS"
+
+    @pytest.mark.parametrize(
+        ("param", "expected"),
+        [("linux", "AL2023"), ("windows", "WIN2022")],
+    )
+    def test_leaves_the_other_platforms_ungated(self, monkeypatch, param, expected) -> None:
+        # A gate that fired for every parametrization would break every existing suite, none of
+        # which sets this variable.
+        monkeypatch.delenv("USE_LOCAL_MAC_WORKER", raising=False)
+        assert self._run(param).name == expected
+
+
+class TestDeadlineResourcesFixtureSignature:
+    def test_does_not_depend_on_the_operating_system(self) -> None:
+        # `operating_system` reads request.param with no fallback, so it resolves only under
+        # indirect parametrization. Declaring it here would break any suite that uses
+        # `deadline_resources` on its own -- at setup, with an AttributeError naming a fixture the
+        # suite never asked for.
+        params = inspect.signature(cast(Any, fixtures.deadline_resources).__wrapped__).parameters
+        assert "operating_system" not in params

@@ -298,7 +298,6 @@ def bootstrap_resources(request: pytest.FixtureRequest) -> BootstrapResources:
 def deadline_resources(
     request: pytest.FixtureRequest,
     deadline_client: DeadlineClient,
-    operating_system: OperatingSystem,
 ) -> Generator[DeadlineResources, None, None]:
     """
     Gets Deadline resources required for running tests.
@@ -312,20 +311,6 @@ def deadline_resources(
     Returns:
         DeadlineResources: The Deadline resources used for tests
     """
-    # Only macOS diverges here. A worker receives sessions only from a fleet whose capabilities it
-    # matches, and a mismatch fails silently: the worker registers, no job is ever scheduled to it,
-    # and the test times out with nothing pointing at the fleet.
-    #
-    # WIN2022 keeps the linux literals it has always had rather than being corrected alongside.
-    # Whether that is load-bearing or latent is not something this change verified, and quietly
-    # altering the fleet a working platform joins is not worth bundling into a macOS fix.
-    if operating_system.is_macos():
-        fleet_os_family = "macos"
-        fleet_cpu_architecture = "arm64"
-    else:
-        fleet_os_family = "linux"
-        fleet_cpu_architecture = "x86_64"
-
     if os.getenv("BYO_DEADLINE", "false").lower() == "true":
         kwargs: dict[str, Any] = {}
         resource_env_vars: list[str] = [
@@ -383,15 +368,18 @@ def deadline_resources(
                         configuration={
                             "customerManaged": {
                                 "mode": "NO_SCALING",
-                                # Derived, not hardcoded. A worker only receives sessions from a
-                                # fleet whose capabilities it matches, and nothing rejects a
-                                # mismatch: the worker registers, then no job is ever scheduled to
-                                # it and the test times out with nothing pointing at the fleet.
+                                # Left as linux/x86_64 for every parametrization, macOS included.
+                                # WIN2022 has always joined a fleet declaring these literals and
+                                # its suites pass, so whatever these values do it is not gating
+                                # worker registration or session assignment on OS or architecture.
+                                # Deriving them per platform would therefore change fleet
+                                # declarations for a benefit no test can demonstrate, while adding
+                                # an arm64 claim that an Intel Mac would contradict.
                                 "workerCapabilities": {
                                     "vCpuCount": {"min": 1},
                                     "memoryMiB": {"min": 1024},
-                                    "osFamily": fleet_os_family,
-                                    "cpuArchitectureType": fleet_cpu_architecture,
+                                    "osFamily": "linux",
+                                    "cpuArchitectureType": "x86_64",
                                 },
                             },
                         },
@@ -552,6 +540,26 @@ def worker_config(
         )
 
 
+def _require_local_mac_worker_optin() -> None:
+    """Refuse a MACOS parametrization unless the host is declared disposable.
+
+    MACOS installs the worker agent onto the machine running the tests, so unlike the EC2 and
+    Docker paths there is no instance or container between the suite and the host. Selecting the
+    `macos` param must not by itself create accounts, grant the agent shutdown rights and write
+    live credentials to disk on whatever Mac happens to run it.
+
+    raise, not assert: this module ships as a pytest11 plugin, so under `python -O` or
+    PYTHONOPTIMIZE every assert in it is compiled away. A gate whose only job is to stop an
+    irreversible change to someone's machine must not be erasable by an interpreter flag.
+    """
+    if os.environ.get("USE_LOCAL_MAC_WORKER", "").lower() != "true":
+        raise RuntimeError(
+            "operating_system is MACOS, which installs the worker agent onto the host running "
+            "the tests. Set USE_LOCAL_MAC_WORKER=true to confirm this host is disposable; see "
+            "the `worker` fixture docstring for what it changes."
+        )
+
+
 @pytest.fixture(scope="session")
 def ec2_worker_type(request: pytest.FixtureRequest) -> Generator[type[DeadlineWorker], None, None]:
     # Allows overriding the base worker type with another derived type.
@@ -633,19 +641,11 @@ def worker(
         # place in a subnet or a security group, and no instance profile to attach. The asserts
         # below would fail on a host that is otherwise perfectly able to run the suite.
         #
-        # Behind an opt-in, mirroring USE_DOCKER_WORKER and for a stronger reason. The Docker path
-        # is contained by the container; this one reconfigures the machine running the tests, so a
-        # suite that merely adds a `macos` param must not silently create accounts, grant the agent
-        # shutdown rights and write live credentials to disk on whatever Mac happens to run it.
-        # raise, not assert: this module ships as a pytest11 plugin, so under python -O or
-        # PYTHONOPTIMIZE every assert in it is compiled away. A gate whose only job is to stop an
-        # irreversible change to someone's machine must not be erasable by an interpreter flag.
-        if os.environ.get("USE_LOCAL_MAC_WORKER", "").lower() != "true":
-            raise RuntimeError(
-                "operating_system is MACOS, which installs the worker agent onto the host running "
-                "the tests. Set USE_LOCAL_MAC_WORKER=true to confirm this host is disposable; see "
-                "the `worker` fixture docstring for what it changes."
-            )
+        # Checked again here, not only in `operating_system`. That call site is the one that fails
+        # early enough to cost nothing, but it is a fixture a suite may override -- and this is the
+        # line past which the host is actually modified, so the gate has to hold even when the
+        # parametrization did not come through the fixture this package ships.
+        _require_local_mac_worker_optin()
         # Verified rather than cast: ec2_worker_type is the documented override point, so a suite
         # that overrides it with an EC2 type would otherwise fail several frames into __init__ on a
         # missing keyword, or construct an EC2 worker with no subnet at all.
@@ -783,6 +783,11 @@ def operating_system(request) -> OperatingSystem:
     if request.param == "linux":
         return OperatingSystem(name="AL2023")
     elif request.param == "macos":
+        # Gated here, the first point at which MACOS is selected, so the refusal lands before any
+        # fixture that costs something: everything a suite would otherwise pay for -- the bootstrap
+        # CloudFormation stack, the farm, the queue, the fleet -- is resolved downstream of this.
+        # The same check runs again in `worker` for suites that override this fixture.
+        _require_local_mac_worker_optin()
         return OperatingSystem(name="MACOS")
     else:
         return OperatingSystem(name="WIN2022")
