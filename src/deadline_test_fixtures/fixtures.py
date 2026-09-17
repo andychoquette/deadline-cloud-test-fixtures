@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import MISSING, InitVar, dataclass, field, fields
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar
 
 import boto3
 import botocore
@@ -574,9 +574,18 @@ def worker(
         USE_DOCKER_WORKER: If set to "true", this fixture will create a Worker that runs in a local Docker container instead of an EC2 instance.
         KEEP_WORKER_AFTER_FAILURE: If set to "true", will not destroy the Worker when it fails. Useful for debugging. Default is "false"
 
-    On MACOS the agent is installed onto the host running the tests, so SUBNET_ID, SECURITY_GROUP_ID,
-    AMI_ID and the worker instance profile do not apply. That host must be macOS with passwordless
-    sudo; see LocalMacWorker.
+    On MACOS the agent is installed onto the host running the tests, so SUBNET_ID,
+    SECURITY_GROUP_ID, AMI_ID and the worker instance profile do not apply. Requires
+    USE_LOCAL_MAC_WORKER=true, because unlike the EC2 and Docker paths there is no disposable
+    instance or container between the suite and the machine: starting the worker creates accounts
+    and groups, writes a sudoers rule letting the agent user impersonate every job user, grants the
+    agent permission to run `shutdown -h now`, writes the test process's AWS credentials to the
+    agent user's ~/.aws/credentials, bootstraps a root LaunchDaemon, and deletes any existing
+    /etc/amazon/deadline/worker.toml and /var/lib/deadline/worker.json. Use a disposable host.
+
+    KEEP_WORKER_AFTER_FAILURE has a heavier meaning on MACOS: skipping stop() leaves the root
+    LaunchDaemon loaded, the impersonation sudoers rule in place and the credentials file on disk,
+    all of which must then be removed by hand.
 
     Returns:
         DeadlineWorker: Instance of the DeadlineWorker class that can be used to interact with the Worker.
@@ -594,8 +603,25 @@ def worker(
         # Before the EC2 branch, because none of what it needs exists here: there is no instance to
         # place in a subnet or a security group, and no instance profile to attach. The asserts
         # below would fail on a host that is otherwise perfectly able to run the suite.
+        #
+        # Behind an opt-in, mirroring USE_DOCKER_WORKER and for a stronger reason. The Docker path
+        # is contained by the container; this one reconfigures the machine running the tests, so a
+        # suite that merely adds a `macos` param must not silently create accounts, grant the agent
+        # shutdown rights and write live credentials to disk on whatever Mac happens to run it.
+        assert os.environ.get("USE_LOCAL_MAC_WORKER", "").lower() == "true", (
+            "operating_system is MACOS, which installs the worker agent onto the host running the "
+            "tests. Set USE_LOCAL_MAC_WORKER=true to confirm this host is disposable; see the "
+            "`worker` fixture docstring for what it changes."
+        )
+        # Verified rather than cast: ec2_worker_type is the documented override point, so a suite
+        # that overrides it with an EC2 type would otherwise fail several frames into __init__ on a
+        # missing keyword, or construct an EC2 worker with no subnet at all.
+        assert issubclass(ec2_worker_type, LocalMacWorker), (
+            f"operating_system is MACOS but ec2_worker_type is {ec2_worker_type.__name__}; "
+            "override it with a LocalMacWorker subclass."
+        )
         LOG.info("Creating local macOS worker")
-        worker = cast("type[LocalMacWorker]", ec2_worker_type)(
+        worker = ec2_worker_type(
             configuration=worker_config,
             deadline_client=boto3.client("deadline"),
         )
@@ -620,7 +646,11 @@ def worker(
         ssm_client = boto3.client("ssm")
         deadline_client = boto3.client("deadline")
 
-        worker = cast("type[EC2InstanceWorker]", ec2_worker_type)(
+        assert issubclass(ec2_worker_type, EC2InstanceWorker), (
+            f"ec2_worker_type is {ec2_worker_type.__name__}, which is not an EC2InstanceWorker; "
+            "the EC2 path passes instance arguments its __init__ will not accept."
+        )
+        worker = ec2_worker_type(
             ec2_client=ec2_client,
             s3_client=s3_client,
             deadline_client=deadline_client,

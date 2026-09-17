@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+import inspect
+from typing import Any, ClassVar, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,6 +26,33 @@ def _worker_type_for(os_name: str) -> type:
     request = MagicMock()
     request.getfixturevalue.return_value = OperatingSystem(name=cast(Any, os_name))
     return next(cast(Any, fixtures.ec2_worker_type).__wrapped__(request))
+
+
+class RecordingMacWorker(LocalMacWorker):
+    """A real LocalMacWorker subclass that records construction instead of touching the host.
+
+    A MagicMock will not do: the fixture issubclass-checks the type it is handed, which is the
+    point of that check.
+    """
+
+    instances: ClassVar[list["RecordingMacWorker"]] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        type(self).instances.append(self)
+        self.kwargs = kwargs
+        self.started = 0
+        self.stopped = 0
+
+    def start(self) -> None:
+        self.started += 1
+
+    def stop(self) -> None:
+        self.stopped += 1
+
+    @classmethod
+    def reset(cls) -> type["RecordingMacWorker"]:
+        cls.instances = []
+        return cls
 
 
 class TestEc2WorkerType:
@@ -65,7 +93,7 @@ class TestWorkerFixtureOnMacos:
     """
 
     @staticmethod
-    def _run(os_name: str, worker_cls: MagicMock) -> MagicMock:
+    def _run(os_name: str, worker_cls: Any) -> Any:
         request = MagicMock()
         request.getfixturevalue.side_effect = lambda name: (
             OperatingSystem(name=cast(Any, os_name)) if name == "operating_system" else MagicMock()
@@ -81,26 +109,33 @@ class TestWorkerFixtureOnMacos:
         monkeypatch.delenv("SUBNET_ID", raising=False)
         monkeypatch.delenv("SECURITY_GROUP_ID", raising=False)
         monkeypatch.delenv("USE_DOCKER_WORKER", raising=False)
+        monkeypatch.setenv("USE_LOCAL_MAC_WORKER", "true")
         monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
 
-        worker_cls = MagicMock()
+        worker_cls = RecordingMacWorker.reset()
         self._run("MACOS", worker_cls)
 
-        worker_cls.assert_called_once()
-        kwargs = worker_cls.call_args.kwargs
+        assert len(worker_cls.instances) == 1
+        kwargs = worker_cls.instances[0].kwargs
         assert set(kwargs) == {"configuration", "deadline_client"}
         for ec2_only in ("subnet_id", "security_group_id", "instance_profile_name", "ec2_client"):
             assert ec2_only not in kwargs
+        # Bound against the real signature, not just compared to a literal set: worker_cls is a
+        # MagicMock, so without this a rename or a new required field on LocalMacWorker would keep
+        # this test green while the fixture raised TypeError.
+        inspect.signature(LocalMacWorker).bind(**kwargs)
 
     def test_starts_and_stops_the_worker(self, monkeypatch) -> None:
         monkeypatch.delenv("USE_DOCKER_WORKER", raising=False)
+        monkeypatch.setenv("USE_LOCAL_MAC_WORKER", "true")
         monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
 
-        worker_cls = MagicMock()
+        worker_cls = RecordingMacWorker.reset()
         worker = self._run("MACOS", worker_cls)
 
-        worker.start.assert_called_once()
-        worker.stop.assert_called_once()
+        assert worker.started == 1
+        assert worker.stopped == 1
+        inspect.signature(LocalMacWorker).bind(**worker.kwargs)
 
     def test_linux_still_requires_a_subnet(self, monkeypatch) -> None:
         # Guards the branch order: putting the macOS check after the EC2 one, or making it too
@@ -111,3 +146,34 @@ class TestWorkerFixtureOnMacos:
 
         with pytest.raises(AssertionError, match="SUBNET_ID"):
             self._run("AL2023", MagicMock())
+
+    def test_refuses_macos_without_the_opt_in(self, monkeypatch) -> None:
+        # The whole point of the gate: a suite that adds a macos param must not reconfigure the
+        # machine running the tests without someone saying so.
+        monkeypatch.delenv("USE_DOCKER_WORKER", raising=False)
+        monkeypatch.delenv("USE_LOCAL_MAC_WORKER", raising=False)
+        monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
+
+        worker_cls = RecordingMacWorker.reset()
+        with pytest.raises(AssertionError, match="USE_LOCAL_MAC_WORKER"):
+            self._run("MACOS", worker_cls)
+        assert worker_cls.instances == []
+
+    def test_rejects_a_non_mac_override_for_macos(self, monkeypatch) -> None:
+        # ec2_worker_type is the documented override point, so the mismatch has to be named here
+        # rather than surfacing as a missing keyword deep in __init__.
+        monkeypatch.delenv("USE_DOCKER_WORKER", raising=False)
+        monkeypatch.setenv("USE_LOCAL_MAC_WORKER", "true")
+        monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
+
+        with pytest.raises(AssertionError, match="override it with a LocalMacWorker subclass"):
+            self._run("MACOS", cast(Any, PosixInstanceBuildWorker))
+
+    def test_rejects_a_mac_override_for_linux(self, monkeypatch) -> None:
+        monkeypatch.delenv("USE_DOCKER_WORKER", raising=False)
+        monkeypatch.setenv("SUBNET_ID", "subnet-0")
+        monkeypatch.setenv("SECURITY_GROUP_ID", "sg-0")
+        monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
+
+        with pytest.raises(AssertionError, match="not an EC2InstanceWorker"):
+            self._run("AL2023", cast(Any, LocalMacWorker))
