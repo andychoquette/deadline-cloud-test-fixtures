@@ -35,7 +35,7 @@ class RecordingMacWorker(LocalMacWorker):
     point of that check.
     """
 
-    instances: ClassVar[list["RecordingMacWorker"]] = []
+    instances: ClassVar[list[RecordingMacWorker]] = []
 
     def __init__(self, **kwargs: Any) -> None:
         type(self).instances.append(self)
@@ -50,7 +50,7 @@ class RecordingMacWorker(LocalMacWorker):
         self.stopped += 1
 
     @classmethod
-    def reset(cls) -> type["RecordingMacWorker"]:
+    def reset(cls) -> type[RecordingMacWorker]:
         cls.instances = []
         return cls
 
