@@ -144,8 +144,10 @@ class TestWorkerFixtureOnMacos:
         monkeypatch.delenv("USE_DOCKER_WORKER", raising=False)
         monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
 
+        # A real EC2 worker class, not a MagicMock: the EC2InstanceWorker check now runs before
+        # the SUBNET_ID assert, so a mock would exercise a different failure than the one named.
         with pytest.raises(AssertionError, match="SUBNET_ID"):
-            self._run("AL2023", MagicMock())
+            self._run("AL2023", PosixInstanceBuildWorker)
 
     def test_refuses_macos_without_the_opt_in(self, monkeypatch) -> None:
         # The whole point of the gate: a suite that adds a macos param must not reconfigure the
@@ -155,7 +157,9 @@ class TestWorkerFixtureOnMacos:
         monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
 
         worker_cls = RecordingMacWorker.reset()
-        with pytest.raises(AssertionError, match="USE_LOCAL_MAC_WORKER"):
+        # RuntimeError, not AssertionError: this module ships as a pytest plugin, so an assert here
+        # would vanish under python -O and the gate would fail open on the destructive path.
+        with pytest.raises(RuntimeError, match="USE_LOCAL_MAC_WORKER"):
             self._run("MACOS", worker_cls)
         assert worker_cls.instances == []
 
@@ -177,3 +181,30 @@ class TestWorkerFixtureOnMacos:
 
         with pytest.raises(AssertionError, match="not an EC2InstanceWorker"):
             self._run("AL2023", cast(Any, LocalMacWorker))
+
+    def test_refuses_docker_and_macos_together(self, monkeypatch) -> None:
+        # Ordering the branches instead would hand back a Linux container for a macos param and
+        # report the macos test ids as passing.
+        monkeypatch.setenv("USE_DOCKER_WORKER", "true")
+        monkeypatch.setenv("USE_LOCAL_MAC_WORKER", "true")
+        monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
+
+        with pytest.raises(RuntimeError, match="not compatible with operating_system MACOS"):
+            self._run("MACOS", RecordingMacWorker.reset())
+
+    def test_tolerates_a_non_class_override(self, monkeypatch) -> None:
+        # ec2_worker_type never required a class, so a factory that used to work must not now die
+        # on `issubclass() arg 1 must be a class` from inside the fixture.
+        monkeypatch.delenv("USE_DOCKER_WORKER", raising=False)
+        monkeypatch.setenv("USE_LOCAL_MAC_WORKER", "true")
+        monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
+
+        built: list = []
+
+        def factory(**kwargs: Any) -> Any:
+            built.append(kwargs)
+            return MagicMock()
+
+        self._run("MACOS", factory)
+        assert len(built) == 1
+        assert set(built[0]) == {"configuration", "deadline_client"}

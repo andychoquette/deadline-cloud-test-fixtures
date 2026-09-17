@@ -298,6 +298,7 @@ def bootstrap_resources(request: pytest.FixtureRequest) -> BootstrapResources:
 def deadline_resources(
     request: pytest.FixtureRequest,
     deadline_client: DeadlineClient,
+    operating_system: OperatingSystem,
 ) -> Generator[DeadlineResources, None, None]:
     """
     Gets Deadline resources required for running tests.
@@ -311,6 +312,20 @@ def deadline_resources(
     Returns:
         DeadlineResources: The Deadline resources used for tests
     """
+    # Only macOS diverges here. A worker receives sessions only from a fleet whose capabilities it
+    # matches, and a mismatch fails silently: the worker registers, no job is ever scheduled to it,
+    # and the test times out with nothing pointing at the fleet.
+    #
+    # WIN2022 keeps the linux literals it has always had rather than being corrected alongside.
+    # Whether that is load-bearing or latent is not something this change verified, and quietly
+    # altering the fleet a working platform joins is not worth bundling into a macOS fix.
+    if operating_system.is_macos():
+        fleet_os_family = "macos"
+        fleet_cpu_architecture = "arm64"
+    else:
+        fleet_os_family = "linux"
+        fleet_cpu_architecture = "x86_64"
+
     if os.getenv("BYO_DEADLINE", "false").lower() == "true":
         kwargs: dict[str, Any] = {}
         resource_env_vars: list[str] = [
@@ -368,11 +383,15 @@ def deadline_resources(
                         configuration={
                             "customerManaged": {
                                 "mode": "NO_SCALING",
+                                # Derived, not hardcoded. A worker only receives sessions from a
+                                # fleet whose capabilities it matches, and nothing rejects a
+                                # mismatch: the worker registers, then no job is ever scheduled to
+                                # it and the test times out with nothing pointing at the fleet.
                                 "workerCapabilities": {
                                     "vCpuCount": {"min": 1},
                                     "memoryMiB": {"min": 1024},
-                                    "osFamily": "linux",
-                                    "cpuArchitectureType": "x86_64",
+                                    "osFamily": fleet_os_family,
+                                    "cpuArchitectureType": fleet_cpu_architecture,
                                 },
                             },
                         },
@@ -593,6 +612,16 @@ def worker(
 
     operating_system = request.getfixturevalue("operating_system")
 
+    # Mutually exclusive rather than ordered. Taking the Docker branch for a MACOS parametrization
+    # would hand back a Linux container while the `macos` test ids still passed -- a green run that
+    # never touched macOS, and easy to hit since one set of environment variables usually covers a
+    # suite parametrized over both.
+    if os.environ.get("USE_DOCKER_WORKER", "").lower() == "true" and operating_system.is_macos():
+        raise RuntimeError(
+            "USE_DOCKER_WORKER is not compatible with operating_system MACOS; the container does "
+            "not run macOS. Deselect the macos param or unset USE_DOCKER_WORKER."
+        )
+
     worker: DeadlineWorker
     if os.environ.get("USE_DOCKER_WORKER", "").lower() == "true":
         LOG.info("Creating Docker worker")
@@ -608,17 +637,26 @@ def worker(
         # is contained by the container; this one reconfigures the machine running the tests, so a
         # suite that merely adds a `macos` param must not silently create accounts, grant the agent
         # shutdown rights and write live credentials to disk on whatever Mac happens to run it.
-        assert os.environ.get("USE_LOCAL_MAC_WORKER", "").lower() == "true", (
-            "operating_system is MACOS, which installs the worker agent onto the host running the "
-            "tests. Set USE_LOCAL_MAC_WORKER=true to confirm this host is disposable; see the "
-            "`worker` fixture docstring for what it changes."
-        )
+        # raise, not assert: this module ships as a pytest11 plugin, so under python -O or
+        # PYTHONOPTIMIZE every assert in it is compiled away. A gate whose only job is to stop an
+        # irreversible change to someone's machine must not be erasable by an interpreter flag.
+        if os.environ.get("USE_LOCAL_MAC_WORKER", "").lower() != "true":
+            raise RuntimeError(
+                "operating_system is MACOS, which installs the worker agent onto the host running "
+                "the tests. Set USE_LOCAL_MAC_WORKER=true to confirm this host is disposable; see "
+                "the `worker` fixture docstring for what it changes."
+            )
         # Verified rather than cast: ec2_worker_type is the documented override point, so a suite
         # that overrides it with an EC2 type would otherwise fail several frames into __init__ on a
         # missing keyword, or construct an EC2 worker with no subnet at all.
-        assert issubclass(ec2_worker_type, LocalMacWorker), (
-            f"operating_system is MACOS but ec2_worker_type is {ec2_worker_type.__name__}; "
-            "override it with a LocalMacWorker subclass."
+        # isinstance(..., type) first: ec2_worker_type is an override point and nothing ever
+        # required the yielded value to be a class, so a factory or partial that used to work must
+        # not now die on `issubclass() arg 1 must be a class`.
+        assert not isinstance(ec2_worker_type, type) or issubclass(
+            ec2_worker_type, LocalMacWorker
+        ), (
+            f"operating_system is MACOS but ec2_worker_type is {ec2_worker_type}; override it "
+            "with a LocalMacWorker subclass."
         )
         LOG.info("Creating local macOS worker")
         worker = ec2_worker_type(
@@ -626,6 +664,15 @@ def worker(
             deadline_client=boto3.client("deadline"),
         )
     else:
+        # Ahead of the asserts and the client construction below, because bootstrap_resources
+        # deploys a CloudFormation stack unless BYO_BOOTSTRAP is set: a suite that overrode this
+        # with the wrong type would otherwise pay a full stack deployment before being told.
+        assert not isinstance(ec2_worker_type, type) or issubclass(
+            ec2_worker_type, EC2InstanceWorker
+        ), (
+            f"ec2_worker_type is {ec2_worker_type}, which is not an EC2InstanceWorker; the EC2 "
+            "path passes instance arguments its __init__ will not accept."
+        )
         LOG.info("Creating EC2 worker")
         ami_id = os.getenv("AMI_ID")
         subnet_id = os.getenv("SUBNET_ID")
@@ -646,10 +693,6 @@ def worker(
         ssm_client = boto3.client("ssm")
         deadline_client = boto3.client("deadline")
 
-        assert issubclass(ec2_worker_type, EC2InstanceWorker), (
-            f"ec2_worker_type is {ec2_worker_type.__name__}, which is not an EC2InstanceWorker; "
-            "the EC2 path passes instance arguments its __init__ will not accept."
-        )
         worker = ec2_worker_type(
             ec2_client=ec2_client,
             s3_client=s3_client,
