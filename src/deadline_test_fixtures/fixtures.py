@@ -36,6 +36,7 @@ from .deadline.worker import (
     PipInstall,
     PosixInstanceBuildWorker,
     WindowsInstanceBuildWorker,
+    _require_local_mac_worker_optin,
 )
 from .job_attachment_manager import JobAttachmentManager
 from .models import (
@@ -540,26 +541,6 @@ def worker_config(
         )
 
 
-def _require_local_mac_worker_optin() -> None:
-    """Refuse a MACOS parametrization unless the host is declared disposable.
-
-    MACOS installs the worker agent onto the machine running the tests, so unlike the EC2 and
-    Docker paths there is no instance or container between the suite and the host. Selecting the
-    `macos` param must not by itself create accounts, grant the agent shutdown rights and write
-    live credentials to disk on whatever Mac happens to run it.
-
-    raise, not assert: this module ships as a pytest11 plugin, so under `python -O` or
-    PYTHONOPTIMIZE every assert in it is compiled away. A gate whose only job is to stop an
-    irreversible change to someone's machine must not be erasable by an interpreter flag.
-    """
-    if os.environ.get("USE_LOCAL_MAC_WORKER", "").lower() != "true":
-        raise RuntimeError(
-            "operating_system is MACOS, which installs the worker agent onto the host running "
-            "the tests. Set USE_LOCAL_MAC_WORKER=true to confirm this host is disposable; see "
-            "the `worker` fixture docstring for what it changes."
-        )
-
-
 @pytest.fixture(scope="session")
 def ec2_worker_type(request: pytest.FixtureRequest) -> Generator[type[DeadlineWorker], None, None]:
     # Allows overriding the base worker type with another derived type.
@@ -641,10 +622,9 @@ def worker(
         # place in a subnet or a security group, and no instance profile to attach. The asserts
         # below would fail on a host that is otherwise perfectly able to run the suite.
         #
-        # Checked again here, not only in `operating_system`. That call site is the one that fails
-        # early enough to cost nothing, but it is a fixture a suite may override -- and this is the
-        # line past which the host is actually modified, so the gate has to hold even when the
-        # parametrization did not come through the fixture this package ships.
+        # Checked again here, not only in `operating_system`: that fixture is an override point,
+        # and this refusal is clearer than the one LocalMacWorker.start() -- the gate no override
+        # can bypass -- would raise a moment later.
         _require_local_mac_worker_optin()
         # Verified rather than cast: ec2_worker_type is the documented override point, so a suite
         # that overrides it with an EC2 type would otherwise fail several frames into __init__ on a
@@ -786,7 +766,8 @@ def operating_system(request) -> OperatingSystem:
         # Gated here, the first point at which MACOS is selected, so the refusal lands before any
         # fixture that costs something: everything a suite would otherwise pay for -- the bootstrap
         # CloudFormation stack, the farm, the queue, the fleet -- is resolved downstream of this.
-        # The same check runs again in `worker` for suites that override this fixture.
+        # The same check runs in `worker` and, as the last line, in LocalMacWorker.start()
+        # itself, for suites that override the fixtures.
         _require_local_mac_worker_optin()
         return OperatingSystem(name="MACOS")
     else:

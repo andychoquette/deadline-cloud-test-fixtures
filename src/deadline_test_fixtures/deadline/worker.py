@@ -1279,6 +1279,33 @@ touch "{self.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME}"
         return ami_ssm_param
 
 
+def _require_local_mac_worker_optin() -> None:
+    """Refuse to run LocalMacWorker unless the host is declared disposable.
+
+    LocalMacWorker installs the worker agent onto the machine running the tests, so unlike the EC2
+    and Docker paths there is no instance or container between the suite and the host: it creates
+    accounts, grants the agent shutdown rights, and writes live credentials to disk on whatever Mac
+    happens to run it.
+
+    Enforced here, in start(), and not only in this package's fixtures: `operating_system` and
+    `worker` are override points, and the worker agent's own e2e suite overrides both, so a gate
+    that lives only in the fixtures never runs for exactly the suite this class was written for.
+    The fixture-level checks remain because they fail earlier -- before the bootstrap
+    CloudFormation stack and the farm, queue and fleet are created -- but this is the line no
+    override can route around.
+
+    raise, not assert: this package ships as a pytest11 plugin, so under `python -O` or
+    PYTHONOPTIMIZE every assert in it is compiled away. A gate whose only job is to stop an
+    irreversible change to someone's machine must not be erasable by an interpreter flag.
+    """
+    if os.environ.get("USE_LOCAL_MAC_WORKER", "").lower() != "true":
+        raise RuntimeError(
+            "LocalMacWorker installs the worker agent onto the host running the tests. Set "
+            "USE_LOCAL_MAC_WORKER=true to confirm this host is disposable; see the class "
+            "docstring for what it changes."
+        )
+
+
 @dataclass
 class LocalMacWorker(DeadlineWorker):
     """A Deadline worker running on the macOS host executing the tests.
@@ -1330,6 +1357,10 @@ class LocalMacWorker(DeadlineWorker):
         assert (
             sys.platform == "darwin"
         ), f"LocalMacWorker requires macOS, but sys.platform is {sys.platform!r}"
+        # Before anything below mutates the host. The fixtures check this too, but they are
+        # override points and a suite that overrides them (the worker agent's e2e suite does)
+        # bypasses those checks entirely; this one it cannot.
+        _require_local_mac_worker_optin()
         # This worker configures and supervises the agent through its LaunchDaemon,
         # which --no-install-service tells the installer not to write. Reject it
         # here rather than failing later on a missing plist.

@@ -927,7 +927,12 @@ class TestLocalMacWorker:
     """
 
     @pytest.fixture
-    def mac_worker(self, worker_config: DeadlineWorkerConfiguration) -> Generator[Any, None, None]:
+    def mac_worker(
+        self, worker_config: DeadlineWorkerConfiguration, monkeypatch: pytest.MonkeyPatch
+    ) -> Generator[Any, None, None]:
+        # start() refuses without this opt-in; these tests are about what start() does once it
+        # runs, so the fixture supplies it. The refusal itself has its own test below.
+        monkeypatch.setenv("USE_LOCAL_MAC_WORKER", "true")
         worker = mod.LocalMacWorker(configuration=worker_config, deadline_client=MagicMock())
 
         def no_subprocess(*args: Any, **kwargs: Any) -> Any:
@@ -1156,5 +1161,23 @@ class TestLocalMacWorker:
         with (
             patch.object(mod.sys, "platform", "linux"),
             pytest.raises(AssertionError, match="requires macOS"),
+        ):
+            mac_worker.start()
+
+    def test_start_refuses_without_the_disposable_host_optin(
+        self, mac_worker: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate the fixtures cannot guarantee: suites override `operating_system` and
+        `worker`, so this is the only check every path to an install goes through.
+
+        Nothing but the platform is patched, so the fixture's subprocess trap doubles as the
+        assertion that the refusal fired before anything touched the host. RuntimeError, not
+        AssertionError: under python -O an assert-based gate would fail open on the one path
+        that reconfigures someone's machine.
+        """
+        monkeypatch.delenv("USE_LOCAL_MAC_WORKER", raising=False)
+        with (
+            patch.object(mod.sys, "platform", "darwin"),
+            pytest.raises(RuntimeError, match="USE_LOCAL_MAC_WORKER"),
         ):
             mac_worker.start()
