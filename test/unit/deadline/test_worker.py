@@ -1158,9 +1158,11 @@ class TestLocalMacWorker:
         assert "-eq 1" in cmd
 
     def test_start_requires_macos(self, mac_worker: Any) -> None:
+        # RuntimeError, not AssertionError: visudo and /etc/sudoers.d exist on Linux too, so this
+        # guard must survive python -O just like the opt-in below it.
         with (
             patch.object(mod.sys, "platform", "linux"),
-            pytest.raises(AssertionError, match="requires macOS"),
+            pytest.raises(RuntimeError, match="requires macOS"),
         ):
             mac_worker.start()
 

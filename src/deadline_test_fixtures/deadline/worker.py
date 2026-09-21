@@ -1354,9 +1354,13 @@ class LocalMacWorker(DeadlineWorker):
     _agent_home: str | None = field(init=False, default=None)
 
     def start(self) -> None:
-        assert (
-            sys.platform == "darwin"
-        ), f"LocalMacWorker requires macOS, but sys.platform is {sys.platform!r}"
+        # raise, not assert, for the same reason as the opt-in below: everything past this line
+        # mutates the host, and visudo and /etc/sudoers.d exist on Linux too, so under python -O
+        # an assert here would let a mis-pointed run take real sudoers writes on the wrong machine.
+        if sys.platform != "darwin":
+            raise RuntimeError(
+                f"LocalMacWorker requires macOS, but sys.platform is {sys.platform!r}"
+            )
         # Before anything below mutates the host. The fixtures check this too, but they are
         # override points and a suite that overrides them (the worker agent's e2e suite does)
         # bypasses those checks entirely; this one it cannot.

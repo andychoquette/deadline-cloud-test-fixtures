@@ -182,15 +182,18 @@ class TestWorkerFixtureOnMacos:
         with pytest.raises(AssertionError, match="not an EC2InstanceWorker"):
             self._run("AL2023", cast(Any, LocalMacWorker))
 
-    def test_refuses_docker_and_macos_together(self, monkeypatch) -> None:
-        # Ordering the branches instead would hand back a Linux container for a macos param and
-        # report the macos test ids as passing.
+    def test_skips_docker_and_macos_together(self, monkeypatch) -> None:
+        # Skip, not raise: the macos ids must not report as passing against a Linux container,
+        # but the parametrizations Docker can serve should keep running under the same
+        # environment. Skipped is the outcome that says both.
         monkeypatch.setenv("USE_DOCKER_WORKER", "true")
         monkeypatch.setenv("USE_LOCAL_MAC_WORKER", "true")
         monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
 
-        with pytest.raises(RuntimeError, match="not compatible with operating_system MACOS"):
-            self._run("MACOS", RecordingMacWorker.reset())
+        worker_cls = RecordingMacWorker.reset()
+        with pytest.raises(pytest.skip.Exception, match="does not run macOS"):
+            self._run("MACOS", worker_cls)
+        assert worker_cls.instances == []
 
     def test_tolerates_a_non_class_override(self, monkeypatch) -> None:
         # ec2_worker_type never required a class, so a factory that used to work must not now die
@@ -210,12 +213,13 @@ class TestWorkerFixtureOnMacos:
         assert set(built[0]) == {"configuration", "deadline_client"}
 
 
-class TestOperatingSystemFixtureGate:
-    """The opt-in is enforced where MACOS is first selected, not only where the host is modified.
+class TestOperatingSystemFixture:
+    """The macos param resolves without the disposable-host opt-in.
 
-    `worker` depends on `worker_config`, which depends on `deadline_resources`; pytest resolves all
-    of those before `worker`'s body runs. A gate only in `worker` therefore fires after the
-    bootstrap stack, farm, queue and fleet already exist -- it stops the install, but not the bill.
+    `operating_system` is also how suites pick path-mapping and temp-dir conventions, including
+    BYO-worker suites that never touch this host, so it must not demand USE_LOCAL_MAC_WORKER for
+    a value that cannot mutate anything. The opt-in is enforced in `worker` and, inescapably, in
+    LocalMacWorker.start() -- the paths that actually install.
     """
 
     @staticmethod
@@ -224,22 +228,11 @@ class TestOperatingSystemFixtureGate:
         request.param = param
         return cast(Any, fixtures.operating_system).__wrapped__(request)
 
-    def test_refuses_macos_without_the_opt_in(self, monkeypatch) -> None:
-        monkeypatch.delenv("USE_LOCAL_MAC_WORKER", raising=False)
-        with pytest.raises(RuntimeError, match="USE_LOCAL_MAC_WORKER"):
-            self._run("macos")
-
-    def test_allows_macos_with_the_opt_in(self, monkeypatch) -> None:
-        monkeypatch.setenv("USE_LOCAL_MAC_WORKER", "true")
-        assert self._run("macos").name == "MACOS"
-
     @pytest.mark.parametrize(
         ("param", "expected"),
-        [("linux", "AL2023"), ("windows", "WIN2022")],
+        [("linux", "AL2023"), ("windows", "WIN2022"), ("macos", "MACOS")],
     )
-    def test_leaves_the_other_platforms_ungated(self, monkeypatch, param, expected) -> None:
-        # A gate that fired for every parametrization would break every existing suite, none of
-        # which sets this variable.
+    def test_resolves_every_platform_without_the_opt_in(self, monkeypatch, param, expected) -> None:
         monkeypatch.delenv("USE_LOCAL_MAC_WORKER", raising=False)
         assert self._run(param).name == expected
 

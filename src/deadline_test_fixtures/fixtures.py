@@ -601,15 +601,13 @@ def worker(
 
     operating_system = request.getfixturevalue("operating_system")
 
-    # Mutually exclusive rather than ordered. Taking the Docker branch for a MACOS parametrization
+    # Skipped rather than ordered or raised. Taking the Docker branch for a MACOS parametrization
     # would hand back a Linux container while the `macos` test ids still passed -- a green run that
-    # never touched macOS, and easy to hit since one set of environment variables usually covers a
-    # suite parametrized over both.
+    # never touched macOS. A skip gives the same protection against that false green (the macos
+    # ids report skipped, not passed) while the parametrizations Docker can serve keep running,
+    # since one set of environment variables usually covers a suite parametrized over several.
     if os.environ.get("USE_DOCKER_WORKER", "").lower() == "true" and operating_system.is_macos():
-        raise RuntimeError(
-            "USE_DOCKER_WORKER is not compatible with operating_system MACOS; the container does "
-            "not run macOS. Deselect the macos param or unset USE_DOCKER_WORKER."
-        )
+        pytest.skip("USE_DOCKER_WORKER is set; the container does not run macOS")
 
     worker: DeadlineWorker
     if os.environ.get("USE_DOCKER_WORKER", "").lower() == "true":
@@ -622,9 +620,8 @@ def worker(
         # place in a subnet or a security group, and no instance profile to attach. The asserts
         # below would fail on a host that is otherwise perfectly able to run the suite.
         #
-        # Checked again here, not only in `operating_system`: that fixture is an override point,
-        # and this refusal is clearer than the one LocalMacWorker.start() -- the gate no override
-        # can bypass -- would raise a moment later.
+        # LocalMacWorker.start() enforces this too and no override can bypass it there; checking
+        # here as well just raises the clearer, fixture-shaped error a moment earlier.
         _require_local_mac_worker_optin()
         # Verified rather than cast: ec2_worker_type is the documented override point, so a suite
         # that overrides it with an EC2 type would otherwise fail several frames into __init__ on a
@@ -763,12 +760,11 @@ def operating_system(request) -> OperatingSystem:
     if request.param == "linux":
         return OperatingSystem(name="AL2023")
     elif request.param == "macos":
-        # Gated here, the first point at which MACOS is selected, so the refusal lands before any
-        # fixture that costs something: everything a suite would otherwise pay for -- the bootstrap
-        # CloudFormation stack, the farm, the queue, the fleet -- is resolved downstream of this.
-        # The same check runs in `worker` and, as the last line, in LocalMacWorker.start()
-        # itself, for suites that override the fixtures.
-        _require_local_mac_worker_optin()
+        # Deliberately not gated on USE_LOCAL_MAC_WORKER. This fixture is also how suites pick
+        # path-mapping and temp-dir conventions, including suites that bring their own worker and
+        # never touch this host; asking those to declare the host disposable would gate a value
+        # that cannot mutate anything. The gate lives in `worker` and in LocalMacWorker.start(),
+        # which between them cover every path that actually installs.
         return OperatingSystem(name="MACOS")
     else:
         return OperatingSystem(name="WIN2022")
