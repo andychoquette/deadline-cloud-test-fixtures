@@ -369,13 +369,10 @@ def deadline_resources(
                         configuration={
                             "customerManaged": {
                                 "mode": "NO_SCALING",
-                                # Left as linux/x86_64 for every parametrization, macOS included.
-                                # WIN2022 has always joined a fleet declaring these literals and
-                                # its suites pass, so whatever these values do it is not gating
-                                # worker registration or session assignment on OS or architecture.
-                                # Deriving them per platform would therefore change fleet
-                                # declarations for a benefit no test can demonstrate, while adding
-                                # an arm64 claim that an Intel Mac would contradict.
+                                # Not derived per platform, macOS included: WIN2022 workers have
+                                # always joined a fleet declaring these literals and their suites
+                                # pass, so these values gate neither registration nor session
+                                # assignment on OS or architecture.
                                 "workerCapabilities": {
                                     "vCpuCount": {"min": 1},
                                     "memoryMiB": {"min": 1024},
@@ -545,9 +542,8 @@ def worker_config(
 def ec2_worker_type(request: pytest.FixtureRequest) -> Generator[type[DeadlineWorker], None, None]:
     # Allows overriding the base worker type with another derived type.
     #
-    # MACOS yields LocalMacWorker, which is not an EC2 worker: it configures the agent on the host
-    # running the tests rather than provisioning a machine. The name is kept because it is the
-    # documented override point that suites already use.
+    # MACOS yields LocalMacWorker, which is not an EC2 worker at all -- the name stays because it
+    # is the override point suites already use.
     operating_system = request.getfixturevalue("operating_system")
 
     if operating_system.name == "AL2023":
@@ -583,17 +579,13 @@ def worker(
         KEEP_WORKER_AFTER_FAILURE: If set to "true", will not destroy the Worker when it fails. Useful for debugging. Default is "false"
 
     On MACOS the agent is installed onto the host running the tests, so SUBNET_ID,
-    SECURITY_GROUP_ID, AMI_ID and the worker instance profile do not apply. Requires
-    USE_LOCAL_MAC_WORKER=true, because unlike the EC2 and Docker paths there is no disposable
-    instance or container between the suite and the machine: starting the worker creates accounts
-    and groups, writes a sudoers rule letting the agent user impersonate every job user, grants the
-    agent permission to run `shutdown -h now`, writes the test process's AWS credentials to the
-    agent user's ~/.aws/credentials, bootstraps a root LaunchDaemon, and deletes any existing
-    /etc/amazon/deadline/worker.toml and /var/lib/deadline/worker.json. Use a disposable host.
+    SECURITY_GROUP_ID, AMI_ID and the worker instance profile do not apply, and
+    USE_LOCAL_MAC_WORKER=true is required to confirm the host is disposable. Starting the worker
+    creates accounts and groups, writes a sudoers rule letting the agent user impersonate every
+    job user, grants it `shutdown -h now`, writes this process's AWS credentials to the agent
+    user's ~/.aws/credentials, and bootstraps a root LaunchDaemon.
 
-    KEEP_WORKER_AFTER_FAILURE has a heavier meaning on MACOS: skipping stop() leaves the root
-    LaunchDaemon loaded, the impersonation sudoers rule in place and the credentials file on disk,
-    all of which must then be removed by hand.
+    KEEP_WORKER_AFTER_FAILURE leaves all of that in place on MACOS, to be removed by hand.
 
     Returns:
         DeadlineWorker: Instance of the DeadlineWorker class that can be used to interact with the Worker.
@@ -601,11 +593,9 @@ def worker(
 
     operating_system = request.getfixturevalue("operating_system")
 
-    # Skipped rather than ordered or raised. Taking the Docker branch for a MACOS parametrization
-    # would hand back a Linux container while the `macos` test ids still passed -- a green run that
-    # never touched macOS. A skip gives the same protection against that false green (the macos
-    # ids report skipped, not passed) while the parametrizations Docker can serve keep running,
-    # since one set of environment variables usually covers a suite parametrized over several.
+    # Skipped, not ordered: falling through to Docker would report macos ids as passing against a
+    # Linux container. Skip rather than raise so the params Docker can serve still run, since one
+    # set of environment variables usually covers a suite parametrized over several.
     if os.environ.get("USE_DOCKER_WORKER", "").lower() == "true" and operating_system.is_macos():
         pytest.skip("USE_DOCKER_WORKER is set; the container does not run macOS")
 
@@ -616,19 +606,14 @@ def worker(
             configuration=worker_config,
         )
     elif operating_system.is_macos():
-        # Before the EC2 branch, because none of what it needs exists here: there is no instance to
-        # place in a subnet or a security group, and no instance profile to attach. The asserts
-        # below would fail on a host that is otherwise perfectly able to run the suite.
+        # Before the EC2 branch: there is no instance to place in a subnet, and its asserts below
+        # would fail on a host that is otherwise able to run the suite.
         #
-        # LocalMacWorker.start() enforces this too and no override can bypass it there; checking
-        # here as well just raises the clearer, fixture-shaped error a moment earlier.
+        # start() enforces this too and cannot be bypassed; here it is just the clearer error.
         _require_local_mac_worker_optin()
-        # Verified rather than cast: ec2_worker_type is the documented override point, so a suite
-        # that overrides it with an EC2 type would otherwise fail several frames into __init__ on a
-        # missing keyword, or construct an EC2 worker with no subnet at all.
-        # isinstance(..., type) first: ec2_worker_type is an override point and nothing ever
-        # required the yielded value to be a class, so a factory or partial that used to work must
-        # not now die on `issubclass() arg 1 must be a class`.
+        # Checked, not cast, so an EC2 type left in this override point is named here rather than
+        # failing on a missing keyword deep in __init__. isinstance first: this fixture never
+        # required a class, so a factory that used to work must not die on issubclass().
         assert not isinstance(ec2_worker_type, type) or issubclass(
             ec2_worker_type, LocalMacWorker
         ), (
@@ -641,10 +626,7 @@ def worker(
             deadline_client=boto3.client("deadline"),
         )
     else:
-        # First in the branch for the clear message, not for cost: worker_config has already
-        # forced deadline_resources -- and with it the bootstrap stack -- before this body ran,
-        # so all this buys is naming the override mistake instead of failing on a missing
-        # keyword several frames into __init__.
+        # Names the override mistake instead of failing on a missing keyword deep in __init__.
         assert not isinstance(ec2_worker_type, type) or issubclass(
             ec2_worker_type, EC2InstanceWorker
         ), (
@@ -761,11 +743,9 @@ def operating_system(request) -> OperatingSystem:
     if request.param == "linux":
         return OperatingSystem(name="AL2023")
     elif request.param == "macos":
-        # Deliberately not gated on USE_LOCAL_MAC_WORKER. This fixture is also how suites pick
-        # path-mapping and temp-dir conventions, including suites that bring their own worker and
-        # never touch this host; asking those to declare the host disposable would gate a value
-        # that cannot mutate anything. The gate lives in `worker` and in LocalMacWorker.start(),
-        # which between them cover every path that actually installs.
+        # Not gated on USE_LOCAL_MAC_WORKER: this fixture also drives path mapping for suites
+        # that bring their own worker, and returning a value cannot mutate a host. `worker` and
+        # LocalMacWorker.start() gate the paths that install.
         return OperatingSystem(name="MACOS")
     else:
         return OperatingSystem(name="WIN2022")

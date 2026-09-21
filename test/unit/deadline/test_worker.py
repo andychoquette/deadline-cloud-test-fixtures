@@ -930,8 +930,8 @@ class TestLocalMacWorker:
     def mac_worker(
         self, worker_config: DeadlineWorkerConfiguration, monkeypatch: pytest.MonkeyPatch
     ) -> Generator[Any, None, None]:
-        # start() refuses without this opt-in; these tests are about what start() does once it
-        # runs, so the fixture supplies it. The refusal itself has its own test below.
+        # start() refuses without the opt-in; its own test covers that. These are about what
+        # start() does once it runs.
         monkeypatch.setenv("USE_LOCAL_MAC_WORKER", "true")
         worker = mod.LocalMacWorker(configuration=worker_config, deadline_client=MagicMock())
 
@@ -1100,8 +1100,7 @@ class TestLocalMacWorker:
     def test_stop_always_boots_out_the_service(self, mac_worker: Any) -> None:
         """No flag tracks how far start() got: stop_worker_service treats an absent label
         as success, so a guard could only suppress a bootout that was correct."""
-        # stop() is a no-op until start() has begun mutating the host; this test is about what
-        # stop() does past that guard.
+        # stop() is a no-op until start() begins mutating; this test is about what follows.
         mac_worker._host_mutation_begun = True
         with (
             patch.object(mac_worker, "send_command", return_value=CommandResult(1, "")),
@@ -1161,8 +1160,8 @@ class TestLocalMacWorker:
         assert "-eq 1" in cmd
 
     def test_start_requires_macos(self, mac_worker: Any) -> None:
-        # RuntimeError, not AssertionError: visudo and /etc/sudoers.d exist on Linux too, so this
-        # guard must survive python -O just like the opt-in below it.
+        # RuntimeError, not AssertionError: /etc/sudoers.d exists on Linux, so this guard has to
+        # survive python -O.
         with (
             patch.object(mod.sys, "platform", "linux"),
             pytest.raises(RuntimeError, match="requires macOS"),
@@ -1179,14 +1178,11 @@ class TestLocalMacWorker:
     def test_stop_is_a_noop_after_a_refused_start(
         self, mac_worker: Any, monkeypatch: pytest.MonkeyPatch, platform: str, optin: Any
     ) -> None:
-        """A refused start() wrote nothing, so the failure teardown that follows must not clean
-        anything: the paths stop() removes are where the real Linux agent keeps its own config,
-        and a Mac has a real daemon under the same launchd label -- so on either platform, the
-        run refused because nobody declared the host disposable is otherwise the run that
-        mutates it on the way out.
+        """A refused start() wrote nothing, so the teardown that follows must clean nothing.
 
-        Nothing but the gates is patched, so the fixture's subprocess trap is the assertion
-        that both start() and stop() returned before shelling anything out.
+        Otherwise the run refused because nobody declared the host disposable is the run that
+        mutates it on the way out. Nothing but the gates is patched, so the fixture's subprocess
+        trap is the assertion that neither call shelled out.
         """
         if optin is None:
             monkeypatch.delenv("USE_LOCAL_MAC_WORKER", raising=False)
@@ -1199,9 +1195,8 @@ class TestLocalMacWorker:
         mac_worker.deadline_client.delete_worker.assert_not_called()
 
     def test_stop_cleans_up_once_start_has_begun_mutating(self, mac_worker: Any) -> None:
-        """The counterpart: a start() that cleared the gates and then failed midway did write,
-        so stop() must clean up after it rather than treating the refusal guard as covering
-        every failed start."""
+        """The counterpart: a start() that cleared the gates and failed midway did write, so
+        stop() must still clean up after it."""
         with (
             patch.object(mod.sys, "platform", "darwin"),
             patch.object(mac_worker, "stop_worker_service"),
@@ -1216,13 +1211,11 @@ class TestLocalMacWorker:
     def test_start_refuses_without_the_disposable_host_optin(
         self, mac_worker: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The gate the fixtures cannot guarantee: suites override `operating_system` and
-        `worker`, so this is the only check every path to an install goes through.
+        """The gate the fixtures cannot guarantee: suites override `worker`, so this is the only
+        check every path to an install goes through.
 
         Nothing but the platform is patched, so the fixture's subprocess trap doubles as the
-        assertion that the refusal fired before anything touched the host. RuntimeError, not
-        AssertionError: under python -O an assert-based gate would fail open on the one path
-        that reconfigures someone's machine.
+        assertion that the refusal fired before anything touched the host.
         """
         monkeypatch.delenv("USE_LOCAL_MAC_WORKER", raising=False)
         with (

@@ -1282,21 +1282,13 @@ touch "{self.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME}"
 def _require_local_mac_worker_optin() -> None:
     """Refuse to run LocalMacWorker unless the host is declared disposable.
 
-    LocalMacWorker installs the worker agent onto the machine running the tests, so unlike the EC2
-    and Docker paths there is no instance or container between the suite and the host: it creates
-    accounts, grants the agent shutdown rights, and writes live credentials to disk on whatever Mac
-    happens to run it.
+    Unlike the EC2 and Docker paths there is no instance or container between the suite and the
+    machine; see the class docstring for what start() changes.
 
-    Enforced here, in start(), and not only in this package's fixtures: `worker` is an override
-    point, and the worker agent's own e2e suite overrides it, so a gate that lives only in the
-    fixtures never runs for exactly the suite this class was written for. The `worker`-fixture
-    check remains for its clearer, fixture-shaped error -- not for cost, since the fixtures it
-    depends on have already created the bootstrap stack and the farm, queue and fleet by the time
-    its body runs -- but this is the line no override can route around.
-
-    raise, not assert: this package ships as a pytest11 plugin, so under `python -O` or
-    PYTHONOPTIMIZE every assert in it is compiled away. A gate whose only job is to stop an
-    irreversible change to someone's machine must not be erasable by an interpreter flag.
+    Called from start(), not only from the fixtures: `worker` is an override point and the worker
+    agent's e2e suite overrides it, so a fixture-only gate misses the suite this class exists for.
+    raise, not assert -- this package is a pytest11 plugin, so `python -O` erases asserts, and a
+    gate against an irreversible change to someone's machine must not be erasable by a flag.
     """
     if os.environ.get("USE_LOCAL_MAC_WORKER", "").lower() != "true":
         raise RuntimeError(
@@ -1353,23 +1345,17 @@ class LocalMacWorker(DeadlineWorker):
 
     _agent_home: str | None = field(init=False, default=None)
 
-    # True from the moment start() has cleared every gate and is about to mutate the host.
-    # stop() keys on it: a start() that was refused -- wrong platform, no opt-in, or the
-    # no_install_service reject -- wrote nothing, so the failure teardown that follows must not
-    # boot out this host's real agent daemon or delete config the refusal existed to protect.
+    # Set once start() clears every gate. stop() keys on it so a refused start(), whose teardown
+    # still calls stop(), cannot clean up a host it never wrote to.
     _host_mutation_begun: bool = field(init=False, default=False)
 
     def start(self) -> None:
-        # raise, not assert, for the same reason as the opt-in below: everything past this line
-        # mutates the host, and visudo and /etc/sudoers.d exist on Linux too, so under python -O
-        # an assert here would let a mis-pointed run take real sudoers writes on the wrong machine.
+        # raise, not assert: /etc/sudoers.d exists on Linux too, so under python -O an erased
+        # assert here would let a mis-pointed run take real sudoers writes on the wrong machine.
         if sys.platform != "darwin":
             raise RuntimeError(
                 f"LocalMacWorker requires macOS, but sys.platform is {sys.platform!r}"
             )
-        # Before anything below mutates the host. The fixtures check this too, but they are
-        # override points and a suite that overrides them (the worker agent's e2e suite does)
-        # bypasses those checks entirely; this one it cannot.
         _require_local_mac_worker_optin()
         # This worker configures and supervises the agent through its LaunchDaemon,
         # which --no-install-service tells the installer not to write. Reject it
@@ -1379,7 +1365,7 @@ class LocalMacWorker(DeadlineWorker):
         ), "LocalMacWorker does not support no_install_service: it manages the agent's LaunchDaemon."
 
         # Every gate is cleared and the next call mutates the host, so from here stop() has
-        # something it may legitimately clean up -- including after a start() that fails midway.
+        # something to clean up, including after a start() that fails midway.
         self._host_mutation_begun = True
 
         # First, before anything slow or fallible. A session killed mid-run leaves both a
@@ -1410,13 +1396,10 @@ class LocalMacWorker(DeadlineWorker):
             self.start_worker_service()
 
     def stop(self) -> None:
-        # Cleans up only what start() may have written, which a flag records rather than the
-        # platform: the paths below are not macOS-only (worker.toml, worker.json and the sudoers
-        # rule live where the real Linux agent keeps its own), and a Mac has a real daemon under
-        # the same launchd label. A start() refused at any gate -- wrong platform, no opt-in,
-        # no_install_service -- is followed by the fixture's failure teardown calling this, and
-        # without the guard that teardown boots out the host's own agent and sudo-deletes its
-        # config: the exact harm the refusal existed to prevent, arriving through cleanup.
+        # Clean up only what start() may have written. The paths below are not macOS-only --
+        # worker.toml, worker.json and the sudoers rule are where the real Linux agent keeps its
+        # own, and a Mac has a daemon under this same label -- so without this the teardown that
+        # follows a refused start() destroys the config that refusal existed to protect.
         if not self._host_mutation_begun:
             LOG.info("start() never began modifying this host, so there is nothing to stop")
             return

@@ -20,8 +20,7 @@ from deadline_test_fixtures.models import OperatingSystem
 def _worker_type_for(os_name: str) -> type:
     """Resolve the ec2_worker_type fixture for one operating system.
 
-    The fixture only reads `operating_system` off the request, so a stub request is enough and
-    avoids standing up the whole session-scoped fixture graph.
+    It only reads `operating_system` off the request, so a stub avoids the session fixture graph.
     """
     request = MagicMock()
     request.getfixturevalue.return_value = OperatingSystem(name=cast(Any, os_name))
@@ -29,10 +28,9 @@ def _worker_type_for(os_name: str) -> type:
 
 
 class RecordingMacWorker(LocalMacWorker):
-    """A real LocalMacWorker subclass that records construction instead of touching the host.
+    """Records construction instead of touching the host.
 
-    A MagicMock will not do: the fixture issubclass-checks the type it is handed, which is the
-    point of that check.
+    A real subclass, not a MagicMock: the fixture issubclass-checks what it is handed.
     """
 
     instances: ClassVar[list[RecordingMacWorker]] = []
@@ -70,15 +68,14 @@ class TestEc2WorkerType:
         assert _worker_type_for(os_name) is expected
 
     def test_rejects_an_unknown_operating_system(self) -> None:
-        # The message is what a suite author sees, so it must name every option that works --
-        # omitting MACOS is what made the macOS branch look unsupported.
+        # The message must name every working option; omitting MACOS is what made the branch
+        # look unsupported.
         with pytest.raises(ValueError, match="MACOS"):
             _worker_type_for("SOLARIS")
 
     def test_macos_worker_is_not_an_ec2_worker(self) -> None:
-        # LocalMacWorker configures the agent on the test host rather than provisioning an
-        # instance, which is why the `worker` fixture must not take the EC2 path for MACOS: there
-        # is no subnet, security group or instance profile to supply.
+        # Why `worker` must not take the EC2 path for MACOS: there is no subnet, security group
+        # or instance profile to supply.
         from deadline_test_fixtures.deadline.worker import EC2InstanceWorker
 
         assert not issubclass(LocalMacWorker, EC2InstanceWorker)
@@ -87,9 +84,8 @@ class TestEc2WorkerType:
 class TestWorkerFixtureOnMacos:
     """The `worker` fixture must not take the EC2 path for MACOS.
 
-    This is the half that was actually broken: `ec2_worker_type` yielding LocalMacWorker is not
-    enough, because the EC2 branch asserts on SUBNET_ID and SECURITY_GROUP_ID, which a host running
-    the agent locally has not got.
+    `ec2_worker_type` yielding LocalMacWorker is not enough: the EC2 branch asserts on SUBNET_ID
+    and SECURITY_GROUP_ID, which a host running the agent locally has not got.
     """
 
     @staticmethod
@@ -120,9 +116,8 @@ class TestWorkerFixtureOnMacos:
         assert set(kwargs) == {"configuration", "deadline_client"}
         for ec2_only in ("subnet_id", "security_group_id", "instance_profile_name", "ec2_client"):
             assert ec2_only not in kwargs
-        # Bound against the real signature, not just compared to a literal set: worker_cls is a
-        # MagicMock, so without this a rename or a new required field on LocalMacWorker would keep
-        # this test green while the fixture raised TypeError.
+        # Bound against the real signature: without it a new required field on LocalMacWorker
+        # would keep this green while the fixture raised TypeError.
         inspect.signature(LocalMacWorker).bind(**kwargs)
 
     def test_starts_and_stops_the_worker(self, monkeypatch) -> None:
@@ -138,8 +133,8 @@ class TestWorkerFixtureOnMacos:
         inspect.signature(LocalMacWorker).bind(**worker.kwargs)
 
     def test_linux_still_requires_a_subnet(self, monkeypatch) -> None:
-        # Guards the branch order: putting the macOS check after the EC2 one, or making it too
-        # broad, would silently drop this requirement for AL2023.
+        # Guards the branch order: a macOS check placed after the EC2 one, or made too broad,
+        # would silently drop this requirement for AL2023.
         monkeypatch.delenv("SUBNET_ID", raising=False)
         monkeypatch.delenv("USE_DOCKER_WORKER", raising=False)
         monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
@@ -157,15 +152,15 @@ class TestWorkerFixtureOnMacos:
         monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
 
         worker_cls = RecordingMacWorker.reset()
-        # RuntimeError, not AssertionError: this module ships as a pytest plugin, so an assert here
-        # would vanish under python -O and the gate would fail open on the destructive path.
+        # RuntimeError, not AssertionError: an assert would vanish under python -O and the gate
+        # would fail open on the destructive path.
         with pytest.raises(RuntimeError, match="USE_LOCAL_MAC_WORKER"):
             self._run("MACOS", worker_cls)
         assert worker_cls.instances == []
 
     def test_rejects_a_non_mac_override_for_macos(self, monkeypatch) -> None:
-        # ec2_worker_type is the documented override point, so the mismatch has to be named here
-        # rather than surfacing as a missing keyword deep in __init__.
+        # The mismatch has to be named here rather than surfacing as a missing keyword deep in
+        # __init__.
         monkeypatch.delenv("USE_DOCKER_WORKER", raising=False)
         monkeypatch.setenv("USE_LOCAL_MAC_WORKER", "true")
         monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
@@ -183,9 +178,8 @@ class TestWorkerFixtureOnMacos:
             self._run("AL2023", cast(Any, LocalMacWorker))
 
     def test_skips_docker_and_macos_together(self, monkeypatch) -> None:
-        # Skip, not raise: the macos ids must not report as passing against a Linux container,
-        # but the parametrizations Docker can serve should keep running under the same
-        # environment. Skipped is the outcome that says both.
+        # Skip, not raise: macos ids must not pass against a Linux container, but the params
+        # Docker can serve should keep running under the same environment.
         monkeypatch.setenv("USE_DOCKER_WORKER", "true")
         monkeypatch.setenv("USE_LOCAL_MAC_WORKER", "true")
         monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
@@ -196,8 +190,8 @@ class TestWorkerFixtureOnMacos:
         assert worker_cls.instances == []
 
     def test_tolerates_a_non_class_override(self, monkeypatch) -> None:
-        # ec2_worker_type never required a class, so a factory that used to work must not now die
-        # on `issubclass() arg 1 must be a class` from inside the fixture.
+        # ec2_worker_type never required a class, so a factory that used to work must not die on
+        # `issubclass() arg 1 must be a class`.
         monkeypatch.delenv("USE_DOCKER_WORKER", raising=False)
         monkeypatch.setenv("USE_LOCAL_MAC_WORKER", "true")
         monkeypatch.setattr(fixtures.boto3, "client", MagicMock())
@@ -216,10 +210,9 @@ class TestWorkerFixtureOnMacos:
 class TestOperatingSystemFixture:
     """The macos param resolves without the disposable-host opt-in.
 
-    `operating_system` is also how suites pick path-mapping and temp-dir conventions, including
-    BYO-worker suites that never touch this host, so it must not demand USE_LOCAL_MAC_WORKER for
-    a value that cannot mutate anything. The opt-in is enforced in `worker` and, inescapably, in
-    LocalMacWorker.start() -- the paths that actually install.
+    This fixture also drives path mapping for BYO-worker suites that never touch the host, and
+    returning a value cannot mutate anything. `worker` and LocalMacWorker.start() gate the paths
+    that install.
     """
 
     @staticmethod
@@ -239,9 +232,8 @@ class TestOperatingSystemFixture:
 
 class TestDeadlineResourcesFixtureSignature:
     def test_does_not_depend_on_the_operating_system(self) -> None:
-        # `operating_system` reads request.param with no fallback, so it resolves only under
-        # indirect parametrization. Declaring it here would break any suite that uses
-        # `deadline_resources` on its own -- at setup, with an AttributeError naming a fixture the
-        # suite never asked for.
+        # `operating_system` reads request.param with no fallback, so declaring it here would
+        # break any suite using `deadline_resources` unparametrized -- at setup, with an
+        # AttributeError naming a fixture it never asked for.
         params = inspect.signature(cast(Any, fixtures.deadline_resources).__wrapped__).parameters
         assert "operating_system" not in params
