@@ -1100,10 +1100,10 @@ class TestLocalMacWorker:
     def test_stop_always_boots_out_the_service(self, mac_worker: Any) -> None:
         """No flag tracks how far start() got: stop_worker_service treats an absent label
         as success, so a guard could only suppress a bootout that was correct."""
+        # stop() is a no-op until start() has begun mutating the host; this test is about what
+        # stop() does past that guard.
+        mac_worker._host_mutation_begun = True
         with (
-            # Pinned, not inherited from the runner: stop() is a deliberate no-op off macOS, so
-            # without this the test only exercises its subject on darwin CI.
-            patch.object(mod.sys, "platform", "darwin"),
             patch.object(mac_worker, "send_command", return_value=CommandResult(1, "")),
             patch.object(mac_worker, "stop_worker_service") as stop,
             patch.object(mac_worker, "_remove_impersonation_sudoers_rule"),
@@ -1169,19 +1169,49 @@ class TestLocalMacWorker:
         ):
             mac_worker.start()
 
-    def test_stop_is_a_noop_off_macos(self, mac_worker: Any) -> None:
-        """stop() must not clean up a host this class never installed on. The paths it removes
-        are not macOS-only -- worker.toml, worker.json and the sudoers rule are where the real
-        Linux agent keeps its own -- and the fixture teardown calls stop() after a failed
-        start(), so without this guard a start() refused on the wrong platform sudo-deletes
-        that host's actual agent config on the way out.
+    @pytest.mark.parametrize(
+        ("platform", "optin"),
+        [
+            pytest.param("linux", "true", id="wrong-platform"),
+            pytest.param("darwin", None, id="no-optin"),
+        ],
+    )
+    def test_stop_is_a_noop_after_a_refused_start(
+        self, mac_worker: Any, monkeypatch: pytest.MonkeyPatch, platform: str, optin: Any
+    ) -> None:
+        """A refused start() wrote nothing, so the failure teardown that follows must not clean
+        anything: the paths stop() removes are where the real Linux agent keeps its own config,
+        and a Mac has a real daemon under the same launchd label -- so on either platform, the
+        run refused because nobody declared the host disposable is otherwise the run that
+        mutates it on the way out.
 
-        Nothing but the platform is patched, so the fixture's subprocess trap is the assertion
-        that stop() returned before shelling anything out.
+        Nothing but the gates is patched, so the fixture's subprocess trap is the assertion
+        that both start() and stop() returned before shelling anything out.
         """
-        with patch.object(mod.sys, "platform", "linux"):
+        if optin is None:
+            monkeypatch.delenv("USE_LOCAL_MAC_WORKER", raising=False)
+        else:
+            monkeypatch.setenv("USE_LOCAL_MAC_WORKER", optin)
+        with patch.object(mod.sys, "platform", platform):
+            with pytest.raises(RuntimeError):
+                mac_worker.start()
             mac_worker.stop()
         mac_worker.deadline_client.delete_worker.assert_not_called()
+
+    def test_stop_cleans_up_once_start_has_begun_mutating(self, mac_worker: Any) -> None:
+        """The counterpart: a start() that cleared the gates and then failed midway did write,
+        so stop() must clean up after it rather than treating the refusal guard as covering
+        every failed start."""
+        with (
+            patch.object(mod.sys, "platform", "darwin"),
+            patch.object(mac_worker, "stop_worker_service"),
+            patch.object(mac_worker, "_reset_host_state"),
+            patch.object(mac_worker, "_stage_file_mappings"),
+            patch.object(mac_worker, "_install_agent", side_effect=RuntimeError("pip failed")),
+            pytest.raises(RuntimeError, match="pip failed"),
+        ):
+            mac_worker.start()
+        assert mac_worker._host_mutation_begun
 
     def test_start_refuses_without_the_disposable_host_optin(
         self, mac_worker: Any, monkeypatch: pytest.MonkeyPatch

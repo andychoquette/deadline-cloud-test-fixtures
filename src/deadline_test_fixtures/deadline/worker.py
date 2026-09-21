@@ -1353,6 +1353,12 @@ class LocalMacWorker(DeadlineWorker):
 
     _agent_home: str | None = field(init=False, default=None)
 
+    # True from the moment start() has cleared every gate and is about to mutate the host.
+    # stop() keys on it: a start() that was refused -- wrong platform, no opt-in, or the
+    # no_install_service reject -- wrote nothing, so the failure teardown that follows must not
+    # boot out this host's real agent daemon or delete config the refusal existed to protect.
+    _host_mutation_begun: bool = field(init=False, default=False)
+
     def start(self) -> None:
         # raise, not assert, for the same reason as the opt-in below: everything past this line
         # mutates the host, and visudo and /etc/sudoers.d exist on Linux too, so under python -O
@@ -1371,6 +1377,10 @@ class LocalMacWorker(DeadlineWorker):
         assert (
             not self.configuration.no_install_service
         ), "LocalMacWorker does not support no_install_service: it manages the agent's LaunchDaemon."
+
+        # Every gate is cleared and the next call mutates the host, so from here stop() has
+        # something it may legitimately clean up -- including after a start() that fails midway.
+        self._host_mutation_begun = True
 
         # First, before anything slow or fallible. A session killed mid-run leaves both a
         # loaded daemon and its worker.json behind, and the installer reloads a daemon it
@@ -1400,14 +1410,15 @@ class LocalMacWorker(DeadlineWorker):
             self.start_worker_service()
 
     def stop(self) -> None:
-        # A host this class never installed on has nothing to clean up, and the paths below are
-        # not macOS-only: worker.toml, worker.json and the sudoers rule live at the same locations
-        # the real Linux agent uses. Without this, a start() refused on the wrong platform is
-        # followed by the fixture's failure teardown, and stop() sudo-deletes that Linux host's
-        # actual agent config -- the exact harm the start() guards exist to prevent, arriving
-        # through cleanup instead.
-        if sys.platform != "darwin":
-            LOG.info("Not macOS; LocalMacWorker installed nothing here, so nothing to stop")
+        # Cleans up only what start() may have written, which a flag records rather than the
+        # platform: the paths below are not macOS-only (worker.toml, worker.json and the sudoers
+        # rule live where the real Linux agent keeps its own), and a Mac has a real daemon under
+        # the same launchd label. A start() refused at any gate -- wrong platform, no opt-in,
+        # no_install_service -- is followed by the fixture's failure teardown calling this, and
+        # without the guard that teardown boots out the host's own agent and sudo-deletes its
+        # config: the exact harm the refusal existed to prevent, arriving through cleanup.
+        if not self._host_mutation_begun:
+            LOG.info("start() never began modifying this host, so there is nothing to stop")
             return
 
         # Read the worker id before booting the daemon out. worker_id is unset when
