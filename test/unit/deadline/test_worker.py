@@ -1101,6 +1101,9 @@ class TestLocalMacWorker:
         """No flag tracks how far start() got: stop_worker_service treats an absent label
         as success, so a guard could only suppress a bootout that was correct."""
         with (
+            # Pinned, not inherited from the runner: stop() is a deliberate no-op off macOS, so
+            # without this the test only exercises its subject on darwin CI.
+            patch.object(mod.sys, "platform", "darwin"),
             patch.object(mac_worker, "send_command", return_value=CommandResult(1, "")),
             patch.object(mac_worker, "stop_worker_service") as stop,
             patch.object(mac_worker, "_remove_impersonation_sudoers_rule"),
