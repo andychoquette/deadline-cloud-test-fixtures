@@ -1287,12 +1287,12 @@ def _require_local_mac_worker_optin() -> None:
     accounts, grants the agent shutdown rights, and writes live credentials to disk on whatever Mac
     happens to run it.
 
-    Enforced here, in start(), and not only in this package's fixtures: `operating_system` and
-    `worker` are override points, and the worker agent's own e2e suite overrides both, so a gate
-    that lives only in the fixtures never runs for exactly the suite this class was written for.
-    The fixture-level checks remain because they fail earlier -- before the bootstrap
-    CloudFormation stack and the farm, queue and fleet are created -- but this is the line no
-    override can route around.
+    Enforced here, in start(), and not only in this package's fixtures: `worker` is an override
+    point, and the worker agent's own e2e suite overrides it, so a gate that lives only in the
+    fixtures never runs for exactly the suite this class was written for. The `worker`-fixture
+    check remains for its clearer, fixture-shaped error -- not for cost, since the fixtures it
+    depends on have already created the bootstrap stack and the farm, queue and fleet by the time
+    its body runs -- but this is the line no override can route around.
 
     raise, not assert: this package ships as a pytest11 plugin, so under `python -O` or
     PYTHONOPTIMIZE every assert in it is compiled away. A gate whose only job is to stop an
@@ -1400,6 +1400,16 @@ class LocalMacWorker(DeadlineWorker):
             self.start_worker_service()
 
     def stop(self) -> None:
+        # A host this class never installed on has nothing to clean up, and the paths below are
+        # not macOS-only: worker.toml, worker.json and the sudoers rule live at the same locations
+        # the real Linux agent uses. Without this, a start() refused on the wrong platform is
+        # followed by the fixture's failure teardown, and stop() sudo-deletes that Linux host's
+        # actual agent config -- the exact harm the start() guards exist to prevent, arriving
+        # through cleanup instead.
+        if sys.platform != "darwin":
+            LOG.info("Not macOS; LocalMacWorker installed nothing here, so nothing to stop")
+            return
+
         # Read the worker id before booting the daemon out. worker_id is unset when
         # start_service was false, and also when start_worker_service raised after
         # the agent had already registered; either way the record leaks if it is not

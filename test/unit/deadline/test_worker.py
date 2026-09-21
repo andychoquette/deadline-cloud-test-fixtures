@@ -1166,6 +1166,20 @@ class TestLocalMacWorker:
         ):
             mac_worker.start()
 
+    def test_stop_is_a_noop_off_macos(self, mac_worker: Any) -> None:
+        """stop() must not clean up a host this class never installed on. The paths it removes
+        are not macOS-only -- worker.toml, worker.json and the sudoers rule are where the real
+        Linux agent keeps its own -- and the fixture teardown calls stop() after a failed
+        start(), so without this guard a start() refused on the wrong platform sudo-deletes
+        that host's actual agent config on the way out.
+
+        Nothing but the platform is patched, so the fixture's subprocess trap is the assertion
+        that stop() returned before shelling anything out.
+        """
+        with patch.object(mod.sys, "platform", "linux"):
+            mac_worker.stop()
+        mac_worker.deadline_client.delete_worker.assert_not_called()
+
     def test_start_refuses_without_the_disposable_host_optin(
         self, mac_worker: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:

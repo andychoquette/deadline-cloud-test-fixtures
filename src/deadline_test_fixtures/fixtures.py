@@ -641,9 +641,10 @@ def worker(
             deadline_client=boto3.client("deadline"),
         )
     else:
-        # Ahead of the asserts and the client construction below, because bootstrap_resources
-        # deploys a CloudFormation stack unless BYO_BOOTSTRAP is set: a suite that overrode this
-        # with the wrong type would otherwise pay a full stack deployment before being told.
+        # First in the branch for the clear message, not for cost: worker_config has already
+        # forced deadline_resources -- and with it the bootstrap stack -- before this body ran,
+        # so all this buys is naming the override mistake instead of failing on a missing
+        # keyword several frames into __init__.
         assert not isinstance(ec2_worker_type, type) or issubclass(
             ec2_worker_type, EC2InstanceWorker
         ), (
